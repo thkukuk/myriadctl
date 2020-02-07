@@ -27,3 +27,6 @@ config.status
 config.sub
 config.guess
 myriadctl-*.tar.*
+dldt
+src/myriadctl
+stamp-h1
