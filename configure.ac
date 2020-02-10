@@ -6,6 +6,24 @@ AC_CONFIG_HEADERS(config.h)
 AC_SUBST(PACKAGE)
 AC_SUBST(VERSION)
 
+if test ${libexecdir} = '${exec_prefix}/libexec'
+then
+  libexecdir='${exec_prefix}/lib'
+  if test "${exec_prefix}" = "NONE"
+  then
+    TMPFILESDIR=${prefix}/lib/tmpfiles.d
+    SYSTEMDDIR=${prefix}/lib/systemd/system
+  else
+    TMPFILESDIR=${exec_prefix}/lib/tmpfiles.d
+    SYSTEMDDIR=${exec_prefix}/lib/systemd/system
+  fi
+else
+  TMPFILESDIR=${libexecdir}/tmpfiles.d
+  SYSTEMDDIR=${libexecdir}/systemd/system
+fi
+AC_SUBST(TMPFILESDIR)
+AC_SUBST(SYSTEMDDIR)
+
 dnl Checks for programs.
 AC_PROG_CC
 dnl If we're using gcc, we want warning flags
@@ -20,5 +38,5 @@ AC_GNU_SOURCE
 
 PKG_CHECK_MODULES([LIBUSB], [libusb-1.0])
 
-AC_OUTPUT(Makefile include/Makefile lib/Makefile src/Makefile)
+AC_OUTPUT(Makefile include/Makefile lib/Makefile src/Makefile systemd/Makefile)
 

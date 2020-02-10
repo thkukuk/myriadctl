@@ -1,0 +1,7 @@
+[Unit]
+Description=Boot Myriad devices
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/myriad

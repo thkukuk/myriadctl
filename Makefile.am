@@ -1,5 +1,5 @@
 AUTOMAKE_OPTIONS = 1.6 foreign check-news dist-xz
-SUBDIRS = include lib src
+SUBDIRS = include lib src systemd
 
 CLEANFILES = *~
 
