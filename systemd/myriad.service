@@ -5,3 +5,6 @@ Before=kubelet.service
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/myriad
+
+[Install]
+WantedBy=multi-user.target
