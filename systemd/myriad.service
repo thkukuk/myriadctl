@@ -4,7 +4,7 @@ Before=kubelet.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/myriad
+ExecStart=/usr/sbin/myriadctl boot
 
 [Install]
 WantedBy=multi-user.target
