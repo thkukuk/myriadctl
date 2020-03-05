@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2019 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -15,8 +15,8 @@
 #include <ctype.h>
 
 #if (defined(_WIN32) || defined(_WIN64))
+#include "win_time.h"
 #include <windows.h>
-#include "gettime.h"
 #include <setupapi.h>
 #include <strsafe.h>
 #include <cfgmgr32.h>
@@ -31,25 +31,26 @@
 #endif
 
 #define MVLOG_UNIT_NAME PCIe
-#include "mvLog.h"
-#include "mvStringUtils.h"
+#include "XLinkLog.h"
+#include "XLinkStringUtils.h"
 #include "pcie_host.h"
+#include "XLinkPlatformTool.h"
 
+#ifndef XLINK_PCIE_DATA_TIMEOUT
+#define XLINK_PCIE_DATA_TIMEOUT 0
+#endif
 
 #define PCIE_DEVICE_ID 0x6200
 #define PCIE_VENDOR_ID 0x8086
 
 #if (defined(_WIN32) || defined(_WIN64))
-static HANDLE global_pcie_lock_fd = NULL;
-static OVERLAPPED global_pcie_lock_overlap = { 0 };
-#define GLOBAL_PCIE_LOCK() LockFileEx(global_pcie_lock_fd, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &global_pcie_lock_overlap)
-#define GLOBAL_PCIE_UNLOCK() UnlockFileEx(global_pcie_lock_fd, 0, MAXDWORD, MAXDWORD, &global_pcie_lock_overlap)
 /* IOCTL commands IDs. for Windows*/
 #define MXLK_DEVICE_TYPE 40001
 
-#define MXLK_STATUS_DEV   CTL_CODE(MXLK_DEVICE_TYPE, 0xA08, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
-#define MXLK_RESET_DEV    CTL_CODE(MXLK_DEVICE_TYPE, 0xA09, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
-#define MXLK_BOOT_DEV     CTL_CODE(MXLK_DEVICE_TYPE, 0xA0A, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
+#define MXLK_STATUS_DEV         CTL_CODE(MXLK_DEVICE_TYPE, 0xA08, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
+#define MXLK_RESET_DEV          CTL_CODE(MXLK_DEVICE_TYPE, 0xA09, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
+#define MXLK_BOOT_DEV           CTL_CODE(MXLK_DEVICE_TYPE, 0xA0A, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
+#define MXLK_BOOTLOADER_DEV     CTL_CODE(MXLK_DEVICE_TYPE, 0xA0B, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 
 #endif
 
@@ -89,42 +90,109 @@ static inline void timeout_to_timeval(unsigned int timeout_ms,
 }
 #endif
 
+static inline void sleepForSeconds(const unsigned int seconds) {
+#if (!defined(_WIN32) && !defined(_WIN64))
+    sleep(seconds);
+#else
+    Sleep(seconds * 1000); // Sleep using miliseconds as input
+#endif
+}
 
-#if (defined(_WIN32) || defined(_WIN64))
-int pcie_write(HANDLE fd, void * buf, size_t bufSize, unsigned int timeout)
-{
-    int bytesWritten;
-    HANDLE dev = fd;
+#if !defined(_WIN32)
+static pcieHostError_t getDeviceFwStatusIOCTL(const int fd, enum mx_fw_status *fwStatus) {
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(fwStatus, PCIE_INVALID_PARAMETERS);
 
-    BOOL ret = WriteFile(dev, buf, bufSize, &bytesWritten, 0);
-    mvLog(MVLOG_DEBUG, "pcie_write windows return  fd %d buff %p bytesWritten %d  errno %d", dev,buf, bytesWritten, errno);
-    if (ret == FALSE)
-        return -errno;
+    int ret = ioctl(fd, MXLK_STATUS_DEV, fwStatus);
 
-    return bytesWritten;
+    if (ret) {
+        mvLog(MVLOG_INFO, "Get device status ioctl failed with error: %d", ret);
+        *fwStatus = MX_FW_STATUS_UNKNOWN_STATE;
+        return PCIE_HOST_ERROR;
+    }
+    return PCIE_HOST_SUCCESS;
 }
 #else
-pcieHostError_t pcie_write(void *fd, void * buf, size_t bufSize, unsigned int timeout_ms)
+static pcieHostError_t getDeviceFwStatusIOCTL(const HANDLE deviceHandle, enum mx_fw_status *fwStatus) {
+    ASSERT_X_LINK_PLATFORM_R(deviceHandle, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(fwStatus, PCIE_INVALID_PARAMETERS);
+
+    DWORD junk = 0;
+
+    BOOL successRc = DeviceIoControl(deviceHandle,          // device to be queried
+                                   MXLK_STATUS_DEV,             // operation to perform
+                                   NULL, 0,                     // no input buffer
+                                   fwStatus, sizeof(*fwStatus), // output buffer
+                                   &junk,                       // # bytes returned
+                                   (LPOVERLAPPED) NULL);        // synchronous I/O
+
+     if (!successRc) {
+         mvLog(MVLOG_ERROR, "Get PCIe device status ioctl failed with error: 0x%x", GetLastError());
+         *fwStatus = MX_FW_STATUS_UNKNOWN_STATE;
+         return PCIE_HOST_ERROR;
+     }
+     return PCIE_HOST_SUCCESS;
+}
+#endif
+
+#if (defined(_WIN32) || defined(_WIN64))
+int pcie_write(HANDLE fd, void * buf, size_t bufSize)
 {
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(buf, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(bufSize >= 0, PCIE_INVALID_PARAMETERS);
+
+    HANDLE dev =  fd;
+    OVERLAPPED Overlapped;
+    HANDLE Event = NULL;
+    bool OutputCode = FALSE;
+    ULONG  bytesWrite;
+
+    ZeroMemory(&Overlapped, sizeof(Overlapped));
+    Event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (Event == NULL) {
+        mvLog(MVLOG_INFO, "Error creating I/O event for pcie_write - 0x%x\n", GetLastError());
+        return PCIE_HOST_ERROR;
+    }
+
+    Overlapped.hEvent = Event;
+    ResetEvent(Overlapped.hEvent);
+    OutputCode = WriteFile(dev, buf, bufSize, NULL, &Overlapped);
+
+    if (OutputCode == FALSE) {
+        if (GetLastError() == ERROR_IO_PENDING) {
+            if (GetOverlappedResult(dev, &Overlapped, &bytesWrite, TRUE)) {
+                CloseHandle(Overlapped.hEvent);
+                return bytesWrite;
+            } else {
+                mvLog(MVLOG_DEBUG, "WriteFile GetOverlappedResult failed");
+            }
+        } else {
+            mvLog(MVLOG_DEBUG, "WriteFile failed with error code = 0x%x \n", GetLastError());
+        }
+    } else {
+        mvLog(MVLOG_DEBUG, "fOverlapped - operation complete immediately");
+    }
+
+    CloseHandle(Overlapped.hEvent);
+
+    return PCIE_HOST_ERROR;
+}
+#else
+int pcie_write(void *fd, void * buf, size_t bufSize)
+{
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(buf, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(bufSize >= 0, PCIE_INVALID_PARAMETERS);
+
     fd_set wrfds;
-    struct timeval timeval;
-    struct timeval *select_timeout;
     int ret;
 
     FD_ZERO(&wrfds);
     FD_SET(*((int*)fd), &wrfds);
 
-    if (timeout_ms)
-    {
-        timeout_to_timeval(timeout_ms, &timeval);
-        select_timeout = &timeval;
-    }
-    else
-    {
-        select_timeout = NULL;
-    }
-
-    ret = select(*((int*)fd) + 1, NULL, &wrfds, NULL, select_timeout);
+    ret = select(*((int*)fd) + 1, NULL, &wrfds, NULL, NULL);
     if (ret < 0)
     {
         return PCIE_HOST_ERROR;
@@ -135,47 +203,73 @@ pcieHostError_t pcie_write(void *fd, void * buf, size_t bufSize, unsigned int ti
     }
 
     ret = write(*((int*)fd), buf, bufSize);
+
     if (ret < 0)
     {
         return PCIE_HOST_ERROR;
     }
-
     return ret;
 }
 #endif  // (defined(_WIN32) || defined(_WIN64))
 
 #if (defined(_WIN32) || defined(_WIN64))
-int pcie_read(HANDLE fd, void * buf, size_t bufSize, unsigned int timeout)
+int pcie_read(HANDLE fd, void * buf, size_t bufSize)
 {
-    int bytesRead;
-    HANDLE dev = fd;
-    BOOL ret = ReadFile(dev, buf, bufSize, &bytesRead, 0);
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(buf, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(bufSize >= 0, PCIE_INVALID_PARAMETERS);
 
-    if (ret == FALSE) {
-        return -errno;
+    HANDLE dev =  fd;
+    OVERLAPPED Overlapped;
+    HANDLE Event = NULL;
+    bool OutputCode = FALSE;
+    ULONG  bytesRead;
+
+    ZeroMemory(&Overlapped, sizeof(Overlapped));
+    Event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (Event == NULL) {
+        mvLog(MVLOG_ERROR, "Error creating I/O event for pcie_read - 0x%x\n", GetLastError());
+        return PCIE_HOST_ERROR;
     }
 
-   return bytesRead;
+    Overlapped.hEvent = Event;
+    ResetEvent(Overlapped.hEvent);
+    OutputCode = ReadFile(dev, buf, bufSize, NULL, &Overlapped);
+
+    if (OutputCode == FALSE) {
+       if (GetLastError() == ERROR_IO_PENDING) {
+           if (GetOverlappedResult(dev, &Overlapped, &bytesRead, TRUE))
+           {
+               CloseHandle(Overlapped.hEvent);
+               return bytesRead;
+            } else{
+               mvLog(MVLOG_DEBUG, "ReadFile GetOverlappedResult failed" );
+            }
+        } else {
+            mvLog(MVLOG_DEBUG, "ReadFile failed with error code = 0x%x \n", GetLastError());
+        }
+    } else {
+         mvLog(MVLOG_DEBUG, "fOverlapped - operation complete immediately");
+    }
+    CloseHandle(Overlapped.hEvent);
+
+    return PCIE_HOST_ERROR;
 }
 #else
-pcieHostError_t pcie_read(void *fd, void *buf, size_t bufSize, unsigned int timeout_ms)
+int pcie_read(void *fd, void *buf, size_t bufSize)
 {
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(buf, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(bufSize >= 0, PCIE_INVALID_PARAMETERS);
+
     fd_set rdfds;
-    struct timeval timeval;
-    struct timeval *select_timeout;
     int ret;
 
     FD_ZERO(&rdfds);
     FD_SET(*((int*)fd), &rdfds);
 
-    if (timeout_ms) {
-        timeout_to_timeval(timeout_ms, &timeval);
-        select_timeout = &timeval;
-    } else {
-        select_timeout = NULL;
-    }
-
-    ret = select(*((int*)fd) + 1, &rdfds, NULL, NULL, select_timeout);
+    ret = select(*((int*)fd) + 1, &rdfds, NULL, NULL, NULL);
     if (ret < 0) {
         return PCIE_HOST_ERROR;
     }
@@ -184,72 +278,48 @@ pcieHostError_t pcie_read(void *fd, void *buf, size_t bufSize, unsigned int time
     }
 
     ret = read(*((int*)fd), buf, bufSize);
+
     if (ret < 0) {
         return PCIE_HOST_ERROR;
     }
-
     return ret;
 }
 #endif
 
 #if (defined(_WIN32) || defined(_WIN64))
-int pcie_init(const char *slot, HANDLE *fd)
+pcieHostError_t pcie_init(const char *slot, HANDLE *fd)
 {
+    ASSERT_X_LINK_PLATFORM_R(slot, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
 
-// Commented out to re-run when the execution is aborted
-/*
-    const char* tempPath = getenv("TEMP");
-    const char pcieMutexName[] = "\\pcie.mutex";
-    if (tempPath) {
-        size_t pathSize = strlen(tempPath) + sizeof(pcieMutexName);
-        char *path = malloc(pathSize);
-        if (!path) {
-            return -1;
-        }
-        mv_strcpy(path, pathSize, tempPath);
-        strcat_s(path, pathSize, pcieMutexName);
-        global_pcie_lock_fd = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        free(path);
-    }
-
-    if (!global_pcie_lock_fd) {
-        mvLog(MVLOG_ERROR, "Global pcie mutex initialization failed.");
-        exit(1);
-    }
-
-    if (!GLOBAL_PCIE_LOCK()) {
-        mvLog(MVLOG_ERROR, "Only one device supported.");
-        return -1;
-    }
-*/
     HANDLE hDevice = CreateFile(slot,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         NULL);
 
     if (hDevice == INVALID_HANDLE_VALUE) {
         mvLog(MVLOG_ERROR, "Failed to open device. Error %d", GetLastError());
-        return -1;
+        return PCIE_HOST_ERROR;
     }
 
     *fd = hDevice;
 
-    mvLog(MVLOG_DEBUG, "pcie_init windows new fd %d", *fd);
-    return 0;
+    mvLog(MVLOG_DEBUG, "PCIe init completed, new fd %d", *fd);
+    return PCIE_HOST_SUCCESS;
 }
 #else
-int pcie_init(const char *slot, void **fd)
+pcieHostError_t pcie_init(const char *slot, void **fd)
 {
-    if (!fd)
-        return -1;
+    ASSERT_X_LINK_PLATFORM_R(slot, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
 
     int mx_fd = open(slot, O_RDWR);
 
     if (mx_fd == -1) {
-        return -1;
+        return PCIE_HOST_DEVICE_NOT_FOUND;
     } else {
         if (!(*fd)) {
             *fd = (int *) malloc(sizeof(int));
@@ -258,39 +328,34 @@ int pcie_init(const char *slot, void **fd)
         if (!(*fd)) {
             mvLog(MVLOG_ERROR, "Memory allocation failed");
             close(mx_fd);
-            return -1;
+            return PCIE_HOST_ERROR;
         }
         *((int*)*fd) = mx_fd;
     }
 
-    return 0;
+    return PCIE_HOST_SUCCESS;
 }
 #endif
 
-int pcie_close(void *fd)
+pcieHostError_t pcie_close(void *fd)
 {
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
 #if (defined(_WIN32) || defined(_WIN64))
-    // Commented out to re-run when the execution is aborted
-    //GLOBAL_PCIE_UNLOCK();
-
     HANDLE hDevice = (HANDLE)fd;
     if (hDevice == INVALID_HANDLE_VALUE) {
         mvLog(MVLOG_ERROR, "Invalid device handle");
-        return -1;
+        return PCIE_HOST_ERROR;
     }
     CloseHandle(hDevice);
 
-    return 0;
+    return PCIE_HOST_SUCCESS;
 #else
-    if (!fd) {
-        mvLog(MVLOG_ERROR, "Incorrect device filedescriptor");
-        return -1;
-    }
+
     int mx_fd = *((int*) fd);
     close(mx_fd);
     free(fd);
 
-    return 0;
+    return PCIE_HOST_SUCCESS;
 #endif
 }
 
@@ -308,8 +373,7 @@ int pci_count_devices(uint16_t vid, uint16_t pid)
     // List all connected PCI devices
     hDevInfo = SetupDiGetClassDevs(NULL, TEXT("PCI"), NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (hDevInfo == INVALID_HANDLE_VALUE)
-        return -1;
-
+        return PCIE_HOST_ERROR;
 
     for (i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &DeviceInfoData); i++)
     {
@@ -336,9 +400,9 @@ int pci_count_devices(uint16_t vid, uint16_t pid)
 
 pcieHostError_t pcie_find_device_port(
     int index, char* port_name, int name_length, const pciePlatformState_t requiredState) {
-    ASSERT_X_LINK_PLATFORM(port_name);
-    ASSERT_X_LINK_PLATFORM(index >= 0);
-    ASSERT_X_LINK_PLATFORM(name_length > 0);
+    ASSERT_X_LINK_PLATFORM_R(port_name, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(index >= 0, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(name_length > 0, PCIE_INVALID_PARAMETERS);
 
     pcieHostError_t rc = PCIE_HOST_DEVICE_NOT_FOUND;
 
@@ -347,7 +411,7 @@ pcieHostError_t pcie_find_device_port(
 
 #if (defined(_WIN32) || defined(_WIN64))
     int amoutOfMyriadPCIeDevices = pci_count_devices(PCIE_VENDOR_ID, PCIE_DEVICE_ID);
-    if (amoutOfMyriadPCIeDevices == 0)
+    if (amoutOfMyriadPCIeDevices <= 0)
         return PCIE_HOST_DEVICE_NOT_FOUND;
 
     int amountOfSuitableDevices = 0;
@@ -431,21 +495,27 @@ pcieHostError_t pcie_find_device_port(
 }
 
 #if (!defined(_WIN32) && !defined(_WIN64))
-int pcie_reset_device(int fd)
+pcieHostError_t pcie_reset_device(int fd)
 {
-    return ioctl(fd, MXLK_RESET_DEV);
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    int ret = ioctl(fd, MXLK_RESET_DEV);
+
+    if (ret) {
+        mvLog(MVLOG_INFO, "Reset ioctl failed with error: %d", ret);
+        return PCIE_HOST_ERROR;
+    }
+    return PCIE_HOST_SUCCESS;
 }
 #else
-int pcie_reset_device(HANDLE fd)
+pcieHostError_t pcie_reset_device(HANDLE fd)
 {
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+
     BOOL bResult   = FALSE;
     DWORD junk     = 0;                     // discard results
     int output_buffer;
 
     mvLog(MVLOG_DEBUG, "calling Windows RESET DeviceIoControl fd %d", fd);
-    if (fd == 0) {
-        return PCIE_HOST_ERROR;
-    }
 
     bResult = DeviceIoControl(fd,                    // device to be queried
                               MXLK_RESET_DEV,                // operation to perform
@@ -457,63 +527,77 @@ int pcie_reset_device(HANDLE fd)
     if (!bResult) {
         mvLog(MVLOG_ERROR, "RESET failed(status = %d).", GetLastError());
         return PCIE_HOST_ERROR;
-    } else {
-        return PCIE_HOST_SUCCESS;
     }
+    return PCIE_HOST_SUCCESS;
 }
 #endif
 
-#if (!defined(_WIN32) && !defined(_WIN64))
-int pcie_boot_device(int fd, void *buffer, size_t length)
+#if !defined(_WIN32)
+pcieHostError_t pcie_boot_device(int fd, void *buffer, size_t length)
+#else
+pcieHostError_t pcie_boot_device(HANDLE fd, void *buffer, size_t length)
+#endif
 {
-    int rc = pcie_reset_device(fd);
-    if (rc) {
-        mvLog(MVLOG_INFO, "Device resetting failed with error: %d\n", rc);
-        return rc;
+    ASSERT_X_LINK_PLATFORM_R(fd, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(buffer, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(length >= 0, PCIE_INVALID_PARAMETERS)
+
+    // Get device context
+    enum mx_fw_status fw_status = MX_FW_STATUS_UNKNOWN_STATE;
+    int deviceStatusRC = getDeviceFwStatusIOCTL(fd, &fw_status);
+
+    if (deviceStatusRC) {
+        return PCIE_HOST_ERROR;
     }
+
+    // After reset PCIe device will lose context, so we need to restore in by calling reset
+    if (fw_status == MX_FW_STATUS_UNKNOWN_STATE) {
+        // Device may be not ready if reset context just after reset
+        sleepForSeconds(3);
+
+        int resetDeviceRC = pcie_reset_device(fd);
+        if (resetDeviceRC) {
+            mvLog(MVLOG_ERROR, "Device resetting failed with error: %d\n", resetDeviceRC);
+            return resetDeviceRC;
+        }
+    }
+#if !defined(_WIN32)
     struct mxlk_boot_param boot_param;
 
     boot_param.buffer = buffer;
     boot_param.length = length;
-    return ioctl(fd, MXLK_BOOT_DEV, &boot_param);
-}
-#else
- int pcie_boot_device(HANDLE fd)
- {
-    int rc = pcie_reset_device(fd);
-    if (rc) {
-        mvLog(MVLOG_INFO, "Device resetting failed with error: %d\n", rc);
-        return rc;
-    }
 
+    int ret = ioctl(fd, MXLK_BOOT_DEV, &boot_param);
+
+    if (ret) {
+        mvLog(MVLOG_INFO, "Boot ioctl failed with error: %d", ret);
+        return PCIE_HOST_ERROR;
+    }
+    return PCIE_HOST_SUCCESS;
+#else
     BOOL bResult   = FALSE;
     DWORD junk     = 0;                     // discard results
     int output_buffer;
-    struct mxlk_boot_param boot_param;
 
-    mvLog(MVLOG_DEBUG, "calling Windows BOOT DeviceIoControl %d",fd);
-    if (fd == 0) {
-        return PCIE_HOST_ERROR;
-    }
+    mvLog(MVLOG_DEBUG, "calling Windows BOOT DeviceIoControl %d, buffer = %p, size = %d",fd, buffer, length);
+
     bResult = DeviceIoControl(fd,                    // device to be queried
                               MXLK_BOOT_DEV,                 // operation to perform
-                              NULL, 0,                      // no input buffer
+                              buffer, length,
                               &output_buffer, sizeof(output_buffer), // output buffer
                               &junk,                         // # bytes returned
                               (LPOVERLAPPED) NULL);          // synchronous I/O
     if (!bResult) {
         mvLog(MVLOG_ERROR, "BOOT failed(status = %d)", GetLastError());
         return PCIE_HOST_ERROR;
-    } else {
-        return PCIE_HOST_SUCCESS;
     }
-}
+    return PCIE_HOST_SUCCESS;
 #endif
-
+}
 
 pcieHostError_t pcie_get_device_state(const char *port_name, pciePlatformState_t *platformState) {
-    ASSERT_X_LINK_PLATFORM(port_name);
-    ASSERT_X_LINK_PLATFORM(platformState);
+    ASSERT_X_LINK_PLATFORM_R(port_name, PCIE_INVALID_PARAMETERS);
+    ASSERT_X_LINK_PLATFORM_R(platformState, PCIE_INVALID_PARAMETERS);
     pcieHostError_t retCode = PCIE_HOST_SUCCESS;
 
 #if (!defined(_WIN32) && !defined(_WIN64))       // Linux implementation
@@ -523,22 +607,22 @@ pcieHostError_t pcie_get_device_state(const char *port_name, pciePlatformState_t
         // driver returns EACCESS in case it instance already used.
         *platformState = PCIE_PLATFORM_BOOTED;
     } else {
-        enum mx_fw_status fw_status= MX_FW_STATUS_UNKNOWN_STATE;
-        int ret = ioctl(mx_fd, MXLK_STATUS_DEV, &fw_status);
-        if(ret){
+        enum mx_fw_status fw_status = MX_FW_STATUS_UNKNOWN_STATE;
+        int deviceStatusRC = getDeviceFwStatusIOCTL(mx_fd, &fw_status);
+
+        if(deviceStatusRC){
             *platformState = PCIE_PLATFORM_ANY_STATE;
-            mvLog(MVLOG_WARN, "Failed to get device status: %d. Errno %d", ret, errno);
             retCode = PCIE_HOST_DEVICE_NOT_FOUND;
         } else if(fw_status == MX_FW_STATUS_USER_APP) {
             *platformState = PCIE_PLATFORM_BOOTED;
         } else {
             *platformState = PCIE_PLATFORM_UNBOOTED;
         }
+
         close(mx_fd);
     }
 #else                                           // Windows implementation
     HANDLE hDevice = INVALID_HANDLE_VALUE;  // handle to the drive to be examined
-    BOOL bResult   = FALSE;                 // results flag
     DWORD junk     = 0;                     // discard results
 
     hDevice = CreateFile(port_name,         // drive to open
@@ -556,16 +640,9 @@ pcieHostError_t pcie_get_device_state(const char *port_name, pciePlatformState_t
         return PCIE_HOST_DEVICE_NOT_FOUND;
     }
     enum mx_fw_status fw_status = MX_FW_STATUS_USER_APP;
+    int deviceStatusRC = getDeviceFwStatusIOCTL(hDevice, &fw_status);
 
-    bResult = DeviceIoControl(hDevice,                       // device to be queried
-                              MXLK_STATUS_DEV, // operation to perform
-                              NULL, 0,                       // no input buffer
-                              &fw_status, sizeof(fw_status), // output buffer
-                              &junk,                         // # bytes returned
-                              (LPOVERLAPPED) NULL);          // synchronous I/O
-
-    if (!bResult) {
-        mvLog(MVLOG_ERROR, "Failed to get device status. Error %d", GetLastError());
+    if (deviceStatusRC) {
         *platformState = PCIE_PLATFORM_ANY_STATE;
         retCode = PCIE_HOST_DEVICE_NOT_FOUND;
         mvLog(MVLOG_DEBUG, "PCIE_PLATFORM_ANY_STATE");

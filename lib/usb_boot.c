@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2019 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -11,8 +11,8 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #if (defined(_WIN32) || defined(_WIN64) )
-#include "usb_winusb.h"
-#include "gettime.h"
+#include "win_usb.h"
+#include "win_time.h"
 #include "win_pthread.h"
 #else
 #include <unistd.h>
@@ -22,7 +22,8 @@
 #endif
 #include "usb_boot.h"
 
-#include "mvStringUtils.h"
+#include "XLinkStringUtils.h"
+#include "XLinkPublicDefines.h"
 
 
 #define DEFAULT_VID                 0x03E7
@@ -401,7 +402,7 @@ usbBootError_t usb_find_device(unsigned idx, char *addr, unsigned addrsize, void
     }
     if (devs_cnt == 0 || idx == 0) {
         devs_cnt = 0;
-        if (((res = usb_list_devices(vid, pid, &devs)) < 0)) {
+        if (((res = usb_list_devices(vid, pid, devs)) < 0)) {
             if (usb_loglevel)
                 fprintf(stderr, "Unable to get USB device list: %s\n", libusb_strerror(res));
             return USB_BOOT_ERROR;
@@ -433,7 +434,7 @@ usbBootError_t usb_find_device(unsigned idx, char *addr, unsigned addrsize, void
         {
             if (device) {
                 const char *caddr = &devs[res][4];
-                if (strstr(addr, caddr))
+                if (strncmp(addr, caddr, XLINK_MAX_NAME_SIZE) == 0)
                 {
                     if (usb_loglevel > 1)
                         fprintf(stderr, "Found Address: %s - VID/PID %04x:%04x\n", caddr, (int)(devs[res][0] << 8 | devs[res][1]), (int)(devs[res][2] << 8 | devs[res][3]));
@@ -444,7 +445,7 @@ usbBootError_t usb_find_device(unsigned idx, char *addr, unsigned addrsize, void
             }
             else if (specificDevice) {
                 const char *caddr = &devs[res][4];
-                if (strstr(addr, caddr))
+                if (strncmp(addr, caddr, XLINK_MAX_NAME_SIZE) == 0)
                 {
                     if (usb_loglevel > 1)
                         fprintf(stderr, "Found Address: %s - VID/PID %04x:%04x\n", caddr, (int)(devs[res][0] << 8 | devs[res][1]), (int)(devs[res][2] << 8 | devs[res][3]));
@@ -613,7 +614,7 @@ static int send_file(libusb_device_handle *h, uint8_t endpoint, const uint8_t *t
     int wb, twb, wbr;
     double elapsedTime;
     highres_time_t t1, t2;
-    unsigned int bulk_chunklen=DEFAULT_CHUNKSZ;
+    int bulk_chunklen=DEFAULT_CHUNKSZ;
     elapsedTime = 0;
     twb = 0;
     p = tx_buf;
@@ -625,7 +626,7 @@ static int send_file(libusb_device_handle *h, uint8_t endpoint, const uint8_t *t
 #endif
     if(usb_loglevel > 1)
         fprintf(stderr, "Performing bulk write of %u bytes...\n", filesize);
-    while(twb < filesize)
+    while((unsigned)twb < filesize)
     {
         highres_gettime(&t1);
         wb = filesize - twb;

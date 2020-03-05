@@ -1,5 +1,5 @@
 dnl Process this file with autoconf to produce a configure script.
-AC_INIT([myriadctl], [0.3])
+AC_INIT([myriadctl], [2020.1.0.4])
 AC_CONFIG_SRCDIR([src/myriadctl.c])
 AM_INIT_AUTOMAKE
 AC_CONFIG_HEADERS(config.h)

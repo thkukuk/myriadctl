@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2019 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -28,7 +28,8 @@ typedef enum{
     X_LINK_DEVICE_NOT_FOUND,
     X_LINK_TIMEOUT,
     X_LINK_ERROR,
-    X_LINK_OUT_OF_MEMORY
+    X_LINK_OUT_OF_MEMORY,
+    X_LINK_NOT_IMPLEMENTED
 } XLinkError_t;
 
 typedef enum{
@@ -52,7 +53,11 @@ typedef enum{
     X_LINK_UNBOOTED,
 } XLinkDeviceState_t;
 
-#define USB_LINK_INVALID_FD  (-314)
+typedef enum{
+    X_LINK_PCIE_UNKNOWN_BOOTLOADER = 0,
+    X_LINK_PCIE_SIMPLIFIED_BOOTLOADER = 1,
+    X_LINK_PCIE_UNIFIED_BOOTLOADER = 2
+} XLinkPCIEBootloader;
 
 #define INVALID_STREAM_ID 0xDEADDEAD
 #define INVALID_STREAM_ID_OUT_OF_MEMORY 0xDEADFFFF
@@ -103,6 +108,7 @@ typedef struct
     XLinkProtocol_t protocol;
 } XLinkHandler_t;
 
+const char* XLinkErrorToStr(XLinkError_t rc);
 
 //Deprecated defines. Begin.
 

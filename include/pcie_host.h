@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2019 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -6,8 +6,10 @@
 #define PCIE_HOST_H
 
 #include "XLinkPlatform.h"
-#include "XLinkPlatform_tool.h"
 
+// ------------------------------------
+//          PCIe Enums
+// ------------------------------------
 typedef enum {
     /* PCIE_PLATFORM_ANY_STATE intended for use in the device requirement,
     /  but also means an unknown state if we cannot get the device status */
@@ -18,16 +20,39 @@ typedef enum {
 
 typedef enum {
     PCIE_HOST_SUCCESS = 0,
-    PCIE_HOST_DEVICE_NOT_FOUND,
-    PCIE_HOST_ERROR,
-    PCIE_HOST_TIMEOUT,
-    PCIE_HOST_DRIVER_NOT_LOADED
+    PCIE_HOST_DEVICE_NOT_FOUND = -1,
+    PCIE_HOST_ERROR = -2,
+    PCIE_HOST_TIMEOUT = -3,
+    PCIE_HOST_DRIVER_NOT_LOADED = -4,
+    PCIE_INVALID_PARAMETERS = -5
 } pcieHostError_t;
 
-int pcie_init(const char *slot, void **fd);
-pcieHostError_t pcie_write(void *fd, void * buf, size_t bufSize, unsigned int timeout_ms);
-pcieHostError_t pcie_read(void *fd, void *buf, size_t bufSize, unsigned int timeout_ms);
-int pcie_close(void *fd);
+// ------------------------------------
+//          PCIe functions
+// ------------------------------------
+
+/**
+ * @brief       Open device on specified slot
+ * @param[in]   slot - device address
+ * @param[out]  fd   - Opened filedescriptor
+ */
+pcieHostError_t pcie_init(const char *slot, void **fd);
+
+pcieHostError_t pcie_close(void *fd);
+
+#if (!defined(_WIN32))
+pcieHostError_t pcie_boot_device(int fd, void *buffer, size_t length);
+pcieHostError_t pcie_reset_device(int fd);
+
+#else // Windows
+pcieHostError_t pcie_boot_device(HANDLE fd, void *buffer, size_t length);
+pcieHostError_t pcie_reset_device(HANDLE fd);
+#endif
+
+int pcie_write(void *fd, void * buf, size_t bufSize);
+
+int pcie_read(void *fd, void *buf, size_t bufSize);
+
 
 /**
  *  @brief Get device name on index
@@ -37,18 +62,13 @@ int pcie_close(void *fd);
 pcieHostError_t pcie_find_device_port(
     int index, char* port_name, int name_length, pciePlatformState_t requiredState);
 
+// ------------------------------------
+//       PCIE Driver specific calls
+// ------------------------------------
 /**
- * @brief Get state for pcie device on specified port
+ * @brief Get state for PCIe device on specified port
  */
 pcieHostError_t pcie_get_device_state(
-    const char * port_name, pciePlatformState_t* platformState);
+        const char *port_name, pciePlatformState_t *platformState);
 
-
-#if (!defined(_WIN32) && !defined(_WIN64))
-int pcie_reset_device(int fd);
-int pcie_boot_device(int fd, void *buffer, size_t length);
-#else
-int pcie_reset_device(HANDLE fd);
-int pcie_boot_device(HANDLE fd);
-#endif
 #endif  // PCIE_HOST_H

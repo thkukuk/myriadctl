@@ -1,3 +1,6 @@
+Version 2020.1.0.4
+* Rebase on dldt 2020.1 driver
+
 Version 0.3
 * Fix systemd service file
 

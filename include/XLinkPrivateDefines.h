@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2019 Intel Corporation
+// Copyright (C) 2018-2020 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -10,24 +10,20 @@
 #ifndef _XLINKPRIVATEDEFINES_H
 #define _XLINKPRIVATEDEFINES_H
 
-#ifdef _XLINK_ENABLE_PRIVATE_INCLUDE_
-# if (defined(_WIN32) || defined(_WIN64))
-#  include "win_semaphore.h"
+#include "XLinkStream.h"
+
+#if !defined(XLINK_ALIGN_TO_BOUNDARY)
+# if defined(_WIN32) && !defined(__GNUC__)
+#  define XLINK_ALIGN_TO_BOUNDARY(_n) __declspec(align(_n))
 # else
-#  ifdef __APPLE__
-#   include "pthread_semaphore.h"
-#  else
-#   include <semaphore.h>
+#  define XLINK_ALIGN_TO_BOUNDARY(_n) __attribute__((aligned(_n)))
 # endif
-# endif
-#include <XLinkPublicDefines.h>
+#endif  // XLINK_ALIGN_TO_BOUNDARY
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
-
-#define HEADER_SIZE (64-12 -8)
 
 #define MAXIMUM_SEMAPHORES 32
 #define __CACHE_LINE_SIZE 64
@@ -52,41 +48,16 @@ typedef struct xLinkDeviceHandle_t {
 } xLinkDeviceHandle_t;
 
 /**
- * @brief Streams opened to device
- */
-typedef struct{
-    char name[MAX_STREAM_NAME_LENGTH];
-    streamId_t id;
-    xLinkDeviceHandle_t deviceHandle;
-    uint32_t writeSize;
-    uint32_t readSize;  /*No need of read buffer. It's on remote,
-    will read it directly to the requested buffer*/
-    streamPacketDesc_t packets[XLINK_MAX_PACKETS_PER_STREAM];
-    uint32_t availablePackets;
-    uint32_t blockedPackets;
-
-    uint32_t firstPacket;
-    uint32_t firstPacketUnused;
-    uint32_t firstPacketFree;
-    uint32_t remoteFillLevel;
-    uint32_t localFillLevel;
-    uint32_t remoteFillPacketLevel;
-
-    uint32_t closeStreamInitiated;
-
-    sem_t sem;
-}streamDesc_t;
-
-/**
  * @brief XLink primitive for each device
  */
 typedef struct xLinkDesc_t {
     // Incremental number, doesn't get decremented.
-    int nextUniqueStreamId;
+    uint32_t nextUniqueStreamId;
     streamDesc_t availableStreams[XLINK_MAX_STREAMS];
     xLinkState_t peerState;
     xLinkDeviceHandle_t deviceHandle;
     linkId_t id;
+    sem_t dispatcherClosedSem;
 
     //Deprecated fields. Begin.
     int hostClosedFD;
@@ -94,6 +65,8 @@ typedef struct xLinkDesc_t {
 
 } xLinkDesc_t;
 
+streamId_t XLinkAddOrUpdateStream(void *fd, const char *name,
+                                  uint32_t writeSize, uint32_t readSize, streamId_t forcedId);
 
 //events which are coming from remote
 typedef enum
@@ -167,21 +140,38 @@ typedef struct xLinkEventHeader_t{
 }xLinkEventHeader_t;
 
 typedef struct xLinkEvent_t {
-    xLinkEventHeader_t header;
+    XLINK_ALIGN_TO_BOUNDARY(64) xLinkEventHeader_t header;
     xLinkDeviceHandle_t deviceHandle;
     void* data;
 }xLinkEvent_t;
 
-int XLinkWaitSem(sem_t* sem);
-int XLinkWaitSemUserMode(sem_t* sem, unsigned int timeout);
+#define XLINK_INIT_EVENT(event, in_streamId, in_type, in_size, in_data, in_deviceHandle) do { \
+    (event).header.streamId = (in_streamId); \
+    (event).header.type = (in_type); \
+    (event).header.size = (in_size); \
+    (event).data = (in_data); \
+    (event).deviceHandle = (in_deviceHandle); \
+} while(0)
 
-const char* XLinkErrorToStr(XLinkError_t rc);
+#define XLINK_EVENT_ACKNOWLEDGE(event) do { \
+    (event)->header.flags.bitField.ack = 1; \
+    (event)->header.flags.bitField.nack = 0; \
+} while(0)
+
+#define XLINK_EVENT_NOT_ACKNOWLEDGE(event) do { \
+    (event)->header.flags.bitField.ack = 0; \
+    (event)->header.flags.bitField.nack = 1; \
+} while(0)
+
+#define XLINK_SET_EVENT_FAILED_AND_SERVE(event) do { \
+    XLINK_EVENT_NOT_ACKNOWLEDGE(event); \
+    (event)->header.flags.bitField.localServe = 1; \
+} while(0)
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif  /*_XLINK_ENABLE_PRIVATE_INCLUDE_ end*/
 #endif
 
 /* end of include file */
